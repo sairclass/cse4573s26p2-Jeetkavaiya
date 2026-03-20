@@ -35,6 +35,38 @@ def _gray(img: torch.Tensor):
         return img
     return K.color.rgb_to_grayscale(img)
 
+# Helper function to compute Harris corner response for a grayscale image.
+def _harris_response(gray: torch.Tensor):
+    grad = K.filters.spatial_gradient(gray)
+    ix = grad[:, :, 0]
+    iy = grad[:, :, 1]
+
+    ix2 = K.filters.gaussian_blur2d(ix * ix, (7, 7), (1.5, 1.5))
+    iy2 = K.filters.gaussian_blur2d(iy * iy, (7, 7), (1.5, 1.5))
+    ixy = K.filters.gaussian_blur2d(ix * iy, (7, 7), (1.5, 1.5))
+
+    k = 0.04
+    det = ix2 * iy2 - ixy * ixy
+    tr = ix2 + iy2
+    r = det - k * tr * tr
+    return r
+
+# Helper function to detect keypoints using Harris corner response and non-maximum suppression.
+def _detect_keypoints(img: torch.Tensor, max_pts=700, patch_size=11, nms_size=9):
+    gray = _gray(img)
+    r = _harris_response(gray)
+
+    margin = patch_size // 2 + 2
+    if r.shape[-2] <= 2 * margin or r.shape[-1] <= 2 * margin:
+        return torch.empty((0, 2), device=img.device)
+
+    r[:, :, :margin, :] = -1e9
+    r[:, :, -margin:, :] = -1e9
+    r[:, :, :, :margin] = -1e9
+    r[:, :, :, -margin:] = -1e9
+
+
+
 
 # ------------------------------------ Task 1 ------------------------------------ #
 def stitch_background(imgs: Dict[str, torch.Tensor]):
