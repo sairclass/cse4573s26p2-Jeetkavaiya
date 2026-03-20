@@ -65,6 +65,282 @@ def _detect_keypoints(img: torch.Tensor, max_pts=700, patch_size=11, nms_size=9)
     r[:, :, :, :margin] = -1e9
     r[:, :, :, -margin:] = -1e9
 
+    mx = torch.nn.functional.max_pool2d(r, kernel_size=nms_size, stride=1, padding=nms_size // 2)
+    keep = (r == mx)
+
+    rmax = r.max()
+    if rmax <= 0:
+        return torch.empty((0, 2), device=img.device)
+
+    keep = keep & (r > 0.01 * rmax)
+
+    pts_yx = torch.nonzero(keep[0, 0], as_tuple=False)
+    if pts_yx.shape[0] == 0:
+        return torch.empty((0, 2), device=img.device)
+
+    vals = r[0, 0, pts_yx[:, 0], pts_yx[:, 1]]
+    vals, order = torch.sort(vals, descending=True)
+    pts_yx = pts_yx[order]
+
+    if pts_yx.shape[0] > max_pts:
+        pts_yx = pts_yx[:max_pts]
+
+    pts_xy = torch.stack([pts_yx[:, 1].float(), pts_yx[:, 0].float()], dim=1)
+    return pts_xy
+
+# Helper function to compute descriptors for keypoints using normalized patches.
+def _describe_patches(img: torch.Tensor, pts_xy: torch.Tensor, patch_size=11):
+    if pts_xy.shape[0] == 0:
+        return torch.empty((0, patch_size * patch_size), device=img.device)
+
+    gray = _gray(img)
+    b, c, h, w = gray.shape
+    rad = patch_size // 2
+
+    padded = torch.nn.functional.pad(gray, (rad, rad, rad, rad), mode='reflect')
+    unfolded = torch.nn.functional.unfold(padded, kernel_size=(patch_size, patch_size))
+    unfolded = unfolded[0].t()  # (H*W, patch_size*patch_size)
+
+    x = pts_xy[:, 0].long().clamp(0, w - 1)
+    y = pts_xy[:, 1].long().clamp(0, h - 1)
+    idx = y * w + x
+
+    desc = unfolded[idx]
+    desc = desc - desc.mean(dim=1, keepdim=True)
+    desc = desc / (desc.std(dim=1, keepdim=True) + 1e-6)
+    desc = torch.nn.functional.normalize(desc, p=2, dim=1)
+    return desc
+
+def _extract_features(img: torch.Tensor, max_pts=700, patch_size=11):
+    pts = _detect_keypoints(img, max_pts=max_pts, patch_size=patch_size)
+    desc = _describe_patches(img, pts, patch_size=patch_size)
+    return pts, desc
+
+# Helper function to match descriptors between two sets using ratio test and mutual nearest neighbor check.
+def _match_descriptors(desc1: torch.Tensor, desc2: torch.Tensor, ratio=0.82):
+    if desc1.shape[0] < 4 or desc2.shape[0] < 4:
+        return torch.empty((0, 2), dtype=torch.long, device=desc1.device)
+
+    dmat = torch.cdist(desc1, desc2, p=2)
+
+    if desc2.shape[0] < 2:
+        return torch.empty((0, 2), dtype=torch.long, device=desc1.device)
+
+    vals12, idx12 = torch.topk(dmat, k=2, largest=False, dim=1)
+    best12 = idx12[:, 0]
+    ratio_ok = vals12[:, 0] / (vals12[:, 1] + 1e-8) < ratio
+
+    best21 = torch.argmin(dmat, dim=0)
+    ids1 = torch.arange(desc1.shape[0], device=desc1.device)
+    mutual = best21[best12] == ids1
+
+    keep = ratio_ok & mutual
+    if keep.sum() == 0:
+        return torch.empty((0, 2), dtype=torch.long, device=desc1.device)
+
+    return torch.stack([ids1[keep], best12[keep]], dim=1)
+
+def _normalize_points(pts: torch.Tensor):
+    mean = pts.mean(dim=0)
+    d = torch.sqrt(((pts - mean) ** 2).sum(dim=1) + 1e-8).mean()
+    s = torch.sqrt(torch.tensor(2.0, device=pts.device)) / (d + 1e-8)
+
+    t = torch.eye(3, device=pts.device, dtype=pts.dtype)
+    t[0, 0] = s
+    t[1, 1] = s
+    t[0, 2] = -s * mean[0]
+    t[1, 2] = -s * mean[1]
+
+    ones = torch.ones((pts.shape[0], 1), device=pts.device, dtype=pts.dtype)
+    pts_h = torch.cat([pts, ones], dim=1)
+    pts_n = (t @ pts_h.t()).t()
+    return pts_n[:, :2], t
+
+# Helper function to compute homography using DLT
+def _dlt_homography(src: torch.Tensor, dst: torch.Tensor):
+    if src.shape[0] < 4:
+        return None
+
+    src_n, t1 = _normalize_points(src)
+    dst_n, t2 = _normalize_points(dst)
+
+    n = src.shape[0]
+    a = torch.zeros((2 * n, 9), device=src.device, dtype=src.dtype)
+
+    x = src_n[:, 0]
+    y = src_n[:, 1]
+    u = dst_n[:, 0]
+    v = dst_n[:, 1]
+
+    a[0::2, 0:3] = torch.stack([-x, -y, -torch.ones_like(x)], dim=1)
+    a[1::2, 3:6] = torch.stack([-x, -y, -torch.ones_like(x)], dim=1)
+    a[0::2, 6:9] = torch.stack([u * x, u * y, u], dim=1)
+    a[1::2, 6:9] = torch.stack([v * x, v * y, v], dim=1)
+
+    try:
+        _, _, vh = torch.linalg.svd(a)
+    except RuntimeError:
+        return None
+
+    h = vh[-1].view(3, 3)
+    h = torch.linalg.inv(t2) @ h @ t1
+
+    if torch.abs(h[2, 2]) < 1e-8:
+        return None
+
+    h = h / h[2, 2]
+    return h
+
+def _project_points(h: torch.Tensor, pts: torch.Tensor):
+    ones = torch.ones((pts.shape[0], 1), device=pts.device, dtype=pts.dtype)
+    pts_h = torch.cat([pts, ones], dim=1)
+    warped = (h @ pts_h.t()).t()
+    z = warped[:, 2:3].clamp(min=1e-8)
+    return warped[:, :2] / z
+
+# Helper function to compute homography using RANSAC
+def _ransac_homography(src: torch.Tensor, dst: torch.Tensor, thresh=4.0, iters=1200):
+    if src.shape[0] < 4:
+        return None, None
+
+    best_h = None
+    best_inliers = None
+    best_count = 0
+    n = src.shape[0]
+
+    for _ in range(iters):
+        ids = torch.randperm(n, device=src.device)[:4]
+        h = _dlt_homography(src[ids], dst[ids])
+        if h is None:
+            continue
+
+        pred = _project_points(h, src)
+        err = torch.sqrt(((pred - dst) ** 2).sum(dim=1) + 1e-8)
+        inliers = err < thresh
+        cnt = int(inliers.sum().item())
+
+        if cnt > best_count:
+            best_count = cnt
+            best_h = h
+            best_inliers = inliers
+
+    if best_h is None or best_inliers is None or best_count < 4:
+        return None, None
+
+    refined = _dlt_homography(src[best_inliers], dst[best_inliers])
+    if refined is not None:
+        best_h = refined
+        pred = _project_points(best_h, src)
+        err = torch.sqrt(((pred - dst) ** 2).sum(dim=1) + 1e-8)
+        best_inliers = err < thresh
+
+    return best_h, best_inliers
+
+# Helper function to estimate homography between two images using feature matching and RANSAC.
+def _estimate_pairwise_h(img1: torch.Tensor, img2: torch.Tensor):
+    pts1, desc1 = _extract_features(img1)
+    pts2, desc2 = _extract_features(img2)
+
+    matches = _match_descriptors(desc1, desc2)
+    if matches.shape[0] < 8:
+        return None, 0, 0.0
+
+    m1 = pts1[matches[:, 0]]
+    m2 = pts2[matches[:, 1]]
+
+    h, inliers = _ransac_homography(m1, m2)
+    if h is None or inliers is None:
+        return None, 0, 0.0
+
+    inlier_count = int(inliers.sum().item())
+    inlier_ratio = float(inlier_count / max(matches.shape[0], 1))
+    return h, inlier_count, inlier_ratio
+
+def _corners_of(img: torch.Tensor):
+    _, h, w = img.shape
+    return torch.tensor(
+        [[0.0, 0.0],
+         [w - 1.0, 0.0],
+         [w - 1.0, h - 1.0],
+         [0.0, h - 1.0]],
+        device=img.device,
+        dtype=img.dtype
+    )
+
+# Helper function to compute the canvas size and translation transform for a set of images and their homographies.
+def _canvas_from_transforms(images, transforms):
+    all_pts = []
+    for img, h in zip(images, transforms):
+        pts = _project_points(h, _corners_of(img))
+        all_pts.append(pts)
+
+    all_pts = torch.cat(all_pts, dim=0)
+    min_xy = torch.floor(all_pts.min(dim=0).values)
+    max_xy = torch.ceil(all_pts.max(dim=0).values)
+
+    tx = -min_xy[0]
+    ty = -min_xy[1]
+
+    width = int((max_xy[0] - min_xy[0] + 1).item())
+    height = int((max_xy[1] - min_xy[1] + 1).item())
+
+    t = torch.eye(3, device=images[0].device, dtype=images[0].dtype)
+    t[0, 2] = tx
+    t[1, 2] = ty
+
+    return t, height, width
+
+# Helper function to warp an image
+def _warp_image_and_mask(img: torch.Tensor, h: torch.Tensor, out_h: int, out_w: int):
+    if img.dim() == 3:
+        img_b = img.unsqueeze(0)
+    else:
+        img_b = img
+
+    h_b = h.unsqueeze(0)
+    warped = K.geometry.transform.warp_perspective(
+        img_b, h_b, (out_h, out_w), mode='bilinear', padding_mode='zeros', align_corners=True
+    )
+
+    mask = torch.ones((1, 1, img.shape[1], img.shape[2]), device=img.device, dtype=img.dtype)
+    warped_mask = K.geometry.transform.warp_perspective(
+        mask, h_b, (out_h, out_w), mode='nearest', padding_mode='zeros', align_corners=True
+    )
+
+    return warped[0], warped_mask[0:1]
+
+# Helper function to blend two warped images using their masks
+def _blend_pair_for_background(w1, m1, w2, m2):
+    both = (m1 > 0.5) & (m2 > 0.5)
+    only1 = (m1 > 0.5) & (~both)
+    only2 = (m2 > 0.5) & (~both)
+
+    out = torch.zeros_like(w1)
+    out[:, only1[0]] = w1[:, only1[0]]
+    out[:, only2[0]] = w2[:, only2[0]]
+
+    if both.any():
+        g1 = _gray(w1.unsqueeze(0))
+        g2 = _gray(w2.unsqueeze(0))
+        diff = (g1 - g2).abs()
+
+        grad1 = K.filters.spatial_gradient(g1)
+        grad2 = K.filters.spatial_gradient(g2)
+        mag1 = torch.sqrt(grad1[:, :, 0] ** 2 + grad1[:, :, 1] ** 2 + 1e-8)
+        mag2 = torch.sqrt(grad2[:, :, 0] ** 2 + grad2[:, :, 1] ** 2 + 1e-8)
+
+        avg = 0.5 * (w1 + w2)
+        choose1 = mag1 <= mag2
+        choose2 = ~choose1
+
+        overlap_hard = both & (diff > 0.12)
+        overlap_soft = both & (~overlap_hard)
+
+        out[:, overlap_soft[0, 0]] = avg[:, overlap_soft[0, 0]]
+        out[:, overlap_hard[0, 0] & choose1[0, 0]] = w1[:, overlap_hard[0, 0] & choose1[0, 0]]
+        out[:, overlap_hard[0, 0] & choose2[0, 0]] = w2[:, overlap_hard[0, 0] & choose2[0, 0]]
+
+    return out
 
 
 
