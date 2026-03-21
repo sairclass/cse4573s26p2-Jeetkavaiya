@@ -26,7 +26,10 @@ def _restore_range(img: torch.Tensor, scale_back: float):
     out = img.clamp(0.0, 1.0)
     if scale_back > 1.5:
         out = out * scale_back
-    return out
+    else:
+        out = out * 255.0
+    return out.round().to(torch.uint8)
+
 
 def _gray(img: torch.Tensor):
     if img.dim() == 3:
@@ -307,27 +310,32 @@ def _warp_image_and_mask(img: torch.Tensor, h: torch.Tensor, out_h: int, out_w: 
         mask, h_b, (out_h, out_w), mode='nearest', padding_mode='zeros', align_corners=True
     )
 
-    return warped[0], warped_mask[0:1]
+    return warped[0], warped_mask[0]
+
 
 # Helper function to blend two warped images using their masks
 def _blend_pair_for_background(w1, m1, w2, m2):
-    both = (m1 > 0.5) & (m2 > 0.5)
-    only1 = (m1 > 0.5) & (~both)
-    only2 = (m2 > 0.5) & (~both)
+    mask1 = (m1[0] > 0.5)
+    mask2 = (m2[0] > 0.5)
+
+    both = mask1 & mask2
+    only1 = mask1 & (~mask2)
+    only2 = mask2 & (~mask1)
 
     out = torch.zeros_like(w1)
-    out[:, only1[0]] = w1[:, only1[0]]
-    out[:, only2[0]] = w2[:, only2[0]]
+    out[:, only1] = w1[:, only1]
+    out[:, only2] = w2[:, only2]
 
     if both.any():
-        g1 = _gray(w1.unsqueeze(0))
-        g2 = _gray(w2.unsqueeze(0))
+        g1 = _gray(w1.unsqueeze(0))[0, 0]
+        g2 = _gray(w2.unsqueeze(0))[0, 0]
         diff = (g1 - g2).abs()
 
-        grad1 = K.filters.spatial_gradient(g1)
-        grad2 = K.filters.spatial_gradient(g2)
-        mag1 = torch.sqrt(grad1[:, :, 0] ** 2 + grad1[:, :, 1] ** 2 + 1e-8)
-        mag2 = torch.sqrt(grad2[:, :, 0] ** 2 + grad2[:, :, 1] ** 2 + 1e-8)
+        grad1 = K.filters.spatial_gradient(g1.unsqueeze(0).unsqueeze(0))
+        grad2 = K.filters.spatial_gradient(g2.unsqueeze(0).unsqueeze(0))
+
+        mag1 = torch.sqrt(grad1[:, :, 0] ** 2 + grad1[:, :, 1] ** 2 + 1e-8)[0, 0]
+        mag2 = torch.sqrt(grad2[:, :, 0] ** 2 + grad2[:, :, 1] ** 2 + 1e-8)[0, 0]
 
         avg = 0.5 * (w1 + w2)
         choose1 = mag1 <= mag2
@@ -336,11 +344,115 @@ def _blend_pair_for_background(w1, m1, w2, m2):
         overlap_hard = both & (diff > 0.12)
         overlap_soft = both & (~overlap_hard)
 
-        out[:, overlap_soft[0, 0]] = avg[:, overlap_soft[0, 0]]
-        out[:, overlap_hard[0, 0] & choose1[0, 0]] = w1[:, overlap_hard[0, 0] & choose1[0, 0]]
-        out[:, overlap_hard[0, 0] & choose2[0, 0]] = w2[:, overlap_hard[0, 0] & choose2[0, 0]]
+        out[:, overlap_soft] = avg[:, overlap_soft]
+        out[:, overlap_hard & choose1] = w1[:, overlap_hard & choose1]
+        out[:, overlap_hard & choose2] = w2[:, overlap_hard & choose2]
 
     return out
+
+
+
+# Helper function to blend multiple warped images using average blending
+def _average_blend(images, transforms):
+    shift, out_h, out_w = _canvas_from_transforms(images, transforms)
+
+    acc = torch.zeros((3, out_h, out_w), device=images[0].device, dtype=images[0].dtype)
+    cnt = torch.zeros((1, out_h, out_w), device=images[0].device, dtype=images[0].dtype)
+
+    for img, h in zip(images, transforms):
+        full_h = shift @ h
+        warped, mask = _warp_image_and_mask(img, full_h, out_h, out_w)
+        acc = acc + warped * mask
+        cnt = cnt + mask
+
+    pano = acc / cnt.clamp(min=1.0)
+    return pano
+
+# Helper function to find the largest connected component in an adjacency matrix
+def _largest_component(adj: torch.Tensor):
+    n = adj.shape[0]
+    seen = torch.zeros(n, dtype=torch.bool, device=adj.device)
+    best = []
+
+    for i in range(n):
+        if seen[i]:
+            continue
+        stack = [int(i)]
+        comp = []
+        seen[i] = True
+
+        while len(stack) > 0:
+            u = stack.pop()
+            comp.append(u)
+            nbrs = torch.nonzero(adj[u] > 0, as_tuple=False).view(-1)
+            for v in nbrs:
+                vv = int(v.item())
+                if not seen[vv]:
+                    seen[vv] = True
+                    stack.append(vv)
+
+        if len(comp) > len(best):
+            best = comp
+
+    return best
+
+# Helper function to choose a reference image from a connected component based on degree in the adjacency matrix
+def _choose_reference(adj: torch.Tensor, comp):
+    if len(comp) == 0:
+        return None
+    degs = []
+    for i in comp:
+        degs.append(int(adj[i].sum().item()))
+    best_idx = 0
+    best_deg = degs[0]
+    for k in range(1, len(comp)):
+        if degs[k] > best_deg:
+            best_deg = degs[k]
+            best_idx = k
+    return comp[best_idx]
+
+# Helper function to build global homographies for a set of images given their pairwise homographies and adjacency matrix.
+def _build_global_transforms(images, adj, pair_h):
+    n = len(images)
+    comp = _largest_component(adj)
+    if len(comp) == 0:
+        return None, []
+
+    ref = _choose_reference(adj, comp)
+    tforms = [None] * n
+    tforms[ref] = torch.eye(3, device=images[0].device, dtype=images[0].dtype)
+
+    queue = [ref]
+    used = set([ref])
+
+    while len(queue) > 0:
+        u = queue.pop(0)
+        for v in comp:
+            if adj[u, v] == 0 or v in used:
+                continue
+
+            if pair_h[u][v] is not None:
+                h_uv = pair_h[u][v]
+                tforms[v] = tforms[u] @ h_uv
+                used.add(v)
+                queue.append(v)
+            elif pair_h[v][u] is not None:
+                try:
+                    h_vu = pair_h[v][u]
+                    tforms[v] = tforms[u] @ torch.linalg.inv(h_vu)
+                    used.add(v)
+                    queue.append(v)
+                except RuntimeError:
+                    pass
+
+    final_ids = []
+    final_h = []
+    for i in comp:
+        if tforms[i] is not None:
+            final_ids.append(i)
+            final_h.append(tforms[i])
+
+    return final_h, final_ids
 
 
 
@@ -405,5 +517,48 @@ def panorama(imgs: Dict[str, torch.Tensor]):
     overlap = torch.empty((3, 256, 256)) # assumed empty 256*256 overlap. Update this as per your logic.
 
     #TODO: Add your code here. Do not modify the return and input arguments.
+    names = sorted(list(imgs.keys()))
+    if len(names) == 0:
+        overlap = torch.zeros((0, 0), dtype=torch.int64)
+        return img, overlap
+
+    raw_images = [imgs[k] for k in names]
+    proc_images = []
+    scale_back = 1.0
+    for im in raw_images:
+        x, s = _to_float01(im)
+        proc_images.append(x)
+        if s > scale_back:
+            scale_back = s
+
+    n = len(proc_images)
+    overlap = torch.eye(n, dtype=torch.int64, device=proc_images[0].device)
+    pair_h = [[None for _ in range(n)] for _ in range(n)]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            h_ij, inliers, ratio = _estimate_pairwise_h(proc_images[i], proc_images[j])
+
+            good = (h_ij is not None) and (inliers >= 18) and (ratio >= 0.18)
+
+            if good:
+                overlap[i, j] = 1
+                overlap[j, i] = 1
+                pair_h[i][j] = h_ij
+                try:
+                    pair_h[j][i] = torch.linalg.inv(h_ij)
+                except RuntimeError:
+                    pair_h[j][i] = None
+
+    global_h, valid_ids = _build_global_transforms(proc_images, overlap, pair_h)
+
+    if global_h is None or len(valid_ids) == 0:
+        img = proc_images[0]
+        img = _restore_range(img, scale_back)
+        return img, overlap
+
+    used_images = [proc_images[i] for i in valid_ids]
+    img = _average_blend(used_images, global_h)
+    img = _restore_range(img, scale_back)
 
     return img, overlap
