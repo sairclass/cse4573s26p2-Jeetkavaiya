@@ -55,7 +55,7 @@ def _harris_response(gray: torch.Tensor):
     return r
 
 # Helper function to detect keypoints using Harris corner response and non-maximum suppression.
-def _detect_keypoints(img: torch.Tensor, max_pts=700, patch_size=11, nms_size=9):
+def _detect_keypoints(img: torch.Tensor, max_pts=1200, patch_size=11, nms_size=7):
     gray = _gray(img)
     r = _harris_response(gray)
 
@@ -114,13 +114,13 @@ def _describe_patches(img: torch.Tensor, pts_xy: torch.Tensor, patch_size=11):
     desc = torch.nn.functional.normalize(desc, p=2, dim=1)
     return desc
 
-def _extract_features(img: torch.Tensor, max_pts=700, patch_size=11):
+def _extract_features(img: torch.Tensor, max_pts=1200, patch_size=11):
     pts = _detect_keypoints(img, max_pts=max_pts, patch_size=patch_size)
     desc = _describe_patches(img, pts, patch_size=patch_size)
     return pts, desc
 
 # Helper function to match descriptors between two sets using ratio test and mutual nearest neighbor check.
-def _match_descriptors(desc1: torch.Tensor, desc2: torch.Tensor, ratio=0.82):
+def _match_descriptors(desc1: torch.Tensor, desc2: torch.Tensor, ratio=0.75):
     if desc1.shape[0] < 4 or desc2.shape[0] < 4:
         return torch.empty((0, 2), dtype=torch.long, device=desc1.device)
 
@@ -202,7 +202,7 @@ def _project_points(h: torch.Tensor, pts: torch.Tensor):
     return warped[:, :2] / z
 
 # Helper function to compute homography using RANSAC
-def _ransac_homography(src: torch.Tensor, dst: torch.Tensor, thresh=4.0, iters=1200):
+def _ransac_homography(src: torch.Tensor, dst: torch.Tensor, thresh=3.0, iters=1500):
     if src.shape[0] < 4:
         return None, None
 
@@ -318,9 +318,9 @@ def _blend_pair_for_background(w1, m1, w2, m2):
     mask1 = (m1[0] > 0.5)
     mask2 = (m2[0] > 0.5)
 
-    both = mask1 & mask2
     only1 = mask1 & (~mask2)
     only2 = mask2 & (~mask1)
+    both = mask1 & mask2
 
     out = torch.zeros_like(w1)
     out[:, only1] = w1[:, only1]
@@ -329,28 +329,28 @@ def _blend_pair_for_background(w1, m1, w2, m2):
     if both.any():
         g1 = _gray(w1.unsqueeze(0))[0, 0]
         g2 = _gray(w2.unsqueeze(0))[0, 0]
+
         diff = (g1 - g2).abs()
 
-        grad1 = K.filters.spatial_gradient(g1.unsqueeze(0).unsqueeze(0))
-        grad2 = K.filters.spatial_gradient(g2.unsqueeze(0).unsqueeze(0))
-
-        mag1 = torch.sqrt(grad1[:, :, 0] ** 2 + grad1[:, :, 1] ** 2 + 1e-8)[0, 0]
-        mag2 = torch.sqrt(grad2[:, :, 0] ** 2 + grad2[:, :, 1] ** 2 + 1e-8)[0, 0]
+        smooth1 = K.filters.gaussian_blur2d(w1.unsqueeze(0), (9, 9), (2.0, 2.0))[0]
+        smooth2 = K.filters.gaussian_blur2d(w2.unsqueeze(0), (9, 9), (2.0, 2.0))[0]
+        g1s = _gray(smooth1.unsqueeze(0))[0, 0]
+        g2s = _gray(smooth2.unsqueeze(0))[0, 0]
+        soft_diff = (g1s - g2s).abs()
 
         avg = 0.5 * (w1 + w2)
-        choose1 = mag1 <= mag2
+
+        choose1 = soft_diff <= 0.08
         choose2 = ~choose1
 
-        overlap_hard = both & (diff > 0.12)
-        overlap_soft = both & (~overlap_hard)
+        soft_region = both & (diff < 0.08)
+        hard_region = both & (~soft_region)
 
-        out[:, overlap_soft] = avg[:, overlap_soft]
-        out[:, overlap_hard & choose1] = w1[:, overlap_hard & choose1]
-        out[:, overlap_hard & choose2] = w2[:, overlap_hard & choose2]
+        out[:, soft_region] = avg[:, soft_region]
+        out[:, hard_region & choose1] = w1[:, hard_region & choose1]
+        out[:, hard_region & choose2] = w2[:, hard_region & choose2]
 
     return out
-
-
 
 # Helper function to blend multiple warped images using average blending
 def _average_blend(images, transforms):
