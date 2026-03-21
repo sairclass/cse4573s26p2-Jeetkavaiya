@@ -355,7 +355,41 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     img = torch.zeros((3, 256, 256)) # assumed 256*256 resolution. Update this as per your logic.
 
     #TODO: Add your code here. Do not modify the return and input arguments.
-    
+    names = sorted(list(imgs.keys()))
+    if len(names) == 0:
+        return img
+
+    img1_raw = imgs[names[0]]
+    if len(names) == 1:
+        img = img1_raw
+        return img
+
+    img2_raw = imgs[names[1]]
+
+    img1, scale1 = _to_float01(img1_raw)
+    img2, scale2 = _to_float01(img2_raw)
+    scale_back = scale1 if scale1 >= scale2 else scale2
+
+    h12, inliers, ratio = _estimate_pairwise_h(img1, img2)
+
+    if h12 is None or inliers < 10:
+        out_h = max(img1.shape[1], img2.shape[1])
+        out_w = img1.shape[2] + img2.shape[2]
+        img = torch.zeros((3, out_h, out_w), device=img1.device, dtype=img1.dtype)
+        img[:, :img1.shape[1], :img1.shape[2]] = img1
+        img[:, :img2.shape[1], img1.shape[2]:img1.shape[2] + img2.shape[2]] = img2
+        return _restore_range(img, scale_back)
+
+    eye = torch.eye(3, device=img1.device, dtype=img1.dtype)
+    transforms = [eye, h12]
+    shift, out_h, out_w = _canvas_from_transforms([img1, img2], transforms)
+
+    w1, m1 = _warp_image_and_mask(img1, shift @ eye, out_h, out_w)
+    w2, m2 = _warp_image_and_mask(img2, shift @ h12, out_h, out_w)
+
+    img = _blend_pair_for_background(w1, m1, w2, m2)
+    img = _restore_range(img, scale_back)
+
     return img
 
 # ------------------------------------ Task 2 ------------------------------------ #
