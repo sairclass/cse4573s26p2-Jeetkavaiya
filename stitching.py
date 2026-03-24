@@ -362,8 +362,10 @@ def _average_blend(images, transforms):
     for img, h in zip(images, transforms):
         full_h = shift @ h
         warped, mask = _warp_image_and_mask(img, full_h, out_h, out_w)
-        acc = acc + warped * mask
-        cnt = cnt + mask
+
+        valid = (mask > 0.5).float()
+        acc = acc + warped * valid
+        cnt = cnt + valid
 
     pano = acc / cnt.clamp(min=1.0)
     return pano
@@ -400,16 +402,17 @@ def _largest_component(adj: torch.Tensor):
 def _choose_reference(adj: torch.Tensor, comp):
     if len(comp) == 0:
         return None
-    degs = []
+    
+    best_node = comp[0]
+    best_score = -1
+
     for i in comp:
-        degs.append(int(adj[i].sum().item()))
-    best_idx = 0
-    best_deg = degs[0]
-    for k in range(1, len(comp)):
-        if degs[k] > best_deg:
-            best_deg = degs[k]
-            best_idx = k
-    return comp[best_idx]
+        deg = int(adj[i].sum().item())
+        if deg > best_score:
+            best_score = deg
+            best_node = i
+    
+    return comp[best_node]
 
 # Helper function to build global homographies for a set of images given their pairwise homographies and adjacency matrix.
 def _build_global_transforms(images, adj, pair_h):
@@ -423,27 +426,23 @@ def _build_global_transforms(images, adj, pair_h):
     tforms[ref] = torch.eye(3, device=images[0].device, dtype=images[0].dtype)
 
     queue = [ref]
-    used = set([ref])
 
     while len(queue) > 0:
         u = queue.pop(0)
+
         for v in comp:
-            if adj[u, v] == 0 or v in used:
+            if v == u or tforms[v] is not None:
                 continue
 
-            if pair_h[u][v] is not None:
-                h_uv = pair_h[u][v]
-                tforms[v] = tforms[u] @ h_uv
-                used.add(v)
-                queue.append(v)
-            elif pair_h[v][u] is not None:
+            if adj[u, v] == 1 and pair_h[v][u] is not None:
                 try:
-                    h_vu = pair_h[v][u]
-                    tforms[v] = tforms[u] @ torch.linalg.inv(h_vu)
-                    used.add(v)
+                    tforms[v] = tforms[u] @ torch.linalg.inv(pair_h[v][u])
                     queue.append(v)
                 except RuntimeError:
                     pass
+            elif adj[u, v] == 1 and pair_h[u][v] is not None:
+                tforms[v] = tforms[u] @ pair_h[u][v]
+                queue.append(v)
 
     final_ids = []
     final_h = []
@@ -539,7 +538,7 @@ def panorama(imgs: Dict[str, torch.Tensor]):
         for j in range(i + 1, n):
             h_ij, inliers, ratio = _estimate_pairwise_h(proc_images[i], proc_images[j])
 
-            good = (h_ij is not None) and (inliers >= 18) and (ratio >= 0.18)
+            good = (h_ij is not None) and (inliers >= 30) and (ratio >= 0.30)
 
             if good:
                 overlap[i, j] = 1
